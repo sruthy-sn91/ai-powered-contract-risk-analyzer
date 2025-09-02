@@ -23,3 +23,42 @@ checkpoints/
 # Build/Dist
 dist/
 build/
+
+.venv/
+venv/
+__pycache__/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Mac OS junk
+.DS_Store
+
+# Generated artifacts / indices / caches / logs
+indices/
+exports/
+*.log
+*.pkl
+*.faiss
+*.pickle
+
+# ML models & checkpoints (use Git LFS if you need to version them)
+models/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.onnx
+
+# Build/Dist
+dist/
+build/

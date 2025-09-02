@@ -1,211 +1,284 @@
-from __future__ import annotations
-import io
+import os
 import re
-import math
-import logging
-from pathlib import Path
-from typing import List, Optional, Tuple, Dict
-from fastapi import UploadFile
-from PIL import Image
+import io
+import shutil
+from dataclasses import dataclass
+from tempfile import NamedTemporaryFile
+from typing import List, Optional, Dict, Any
+
 import fitz  # PyMuPDF
 import pdfplumber
-import pytesseract
-from langdetect import detect as lang_detect
-from backend.app.schemas.extraction import (
-    ParsedPage,
-    ClauseSegment,
-    ParsingResult,
-    DetectedMeta,
-)
-from backend.app.core.path_resolver import index_dir
+from fastapi import UploadFile, HTTPException
 
-WATERMARK_TERMS = ["CONFIDENTIAL", "DRAFT", "SAMPLE", "VOID", "WATERMARK"]
-GOV_LAW_PAT = re.compile(r"(?i)\bgoverned by(?: the laws of)? ([A-Za-z ,&.-]+)")
-JURIS_PAT = re.compile(r"(?i)\bexclusive jurisdiction of ([A-Za-z ,&.-]+)|\bcourts of ([A-Za-z ,&.-]+)")
-CURRENCY_SYMBOLS = {
-    "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY", "₹": "INR", "C$": "CAD", "A$": "AUD",
+try:
+    from docx import Document  # python-docx
+except Exception:  # pragma: no cover
+    Document = None
+
+try:
+    import pytesseract
+    from PIL import Image
+except Exception:  # pragma: no cover
+    pytesseract = None
+    Image = None
+
+# ---------- Simple schema-compatible containers ----------
+
+@dataclass
+class PageOut:
+    page_number: int
+    text: str
+    ocr_used: bool
+    rotation: int
+    has_tables: bool
+    watermarks: List[str]
+    quality_score: float
+
+@dataclass
+class ClauseOut:
+    id: str
+    title: str
+    heading: str
+    start: int
+    end: int
+
+@dataclass
+class ParsingResultOut:
+    pages: List[PageOut]
+    normalized_text: str
+    clauses: List[ClauseOut]
+    meta: Dict[str, Any]
+
+
+# ---------- Heuristics & helpers ----------
+
+GOV_LAW_RE = re.compile(r"(?i)govern(ed|ing)\s+by\s+the\s+laws?\s+of\s+([A-Za-z ]+)")
+CURRENCY_RE = re.compile(r"(?i)\b(USD|EUR|GBP|JPY|INR|AUD|CAD|CHF|SGD|CNY|RMB|HKD|AED|SAR)\b")
+LANG_HINTS = {
+    "en": [r"\bthe\b", r"\band\b", r"\bagreement\b"],
+    "fr": [r"\ble\b", r"\bet\b", r"\bcontrat\b"],
+    "de": [r"\bdas\b", r"\bund\b", r"\bvertrag\b"],
+    "es": [r"\bel\b", r"\by\b", r"\bacuerdo\b"],
 }
-CURRENCY_CODES = {"USD","EUR","GBP","JPY","INR","CAD","AUD","CHF","CNY","HKD","SGD","SEK","NOK","DKK"}
 
-def _bytes_to_path(tmp_dir: Path, filename: str, data: bytes) -> Path:
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    p = tmp_dir / filename
-    p.write_bytes(data)
-    return p
+def detect_languages(text: str) -> List[str]:
+    hits = []
+    lower = text.lower()
+    for lang, pats in LANG_HINTS.items():
+        score = sum(1 for p in pats if re.search(p, lower))
+        if score >= 2:
+            hits.append(lang)
+    return hits or ["en"]
 
-def _extract_with_fitz(pdf_path: Path) -> Tuple[List[ParsedPage], List[List[str]]]:
-    pages: List[ParsedPage] = []
-    tables_flags: List[List[str]] = []
+def detect_currencies(text: str) -> List[str]:
+    return sorted(set(m.group(1).upper() for m in CURRENCY_RE.finditer(text)))
 
-    with fitz.open(str(pdf_path)) as doc:
-        for i, page in enumerate(doc, start=1):
-            rot = int(page.rotation or 0)
-            blocks = page.get_text("blocks")
-            lefts = [b[0] for b in blocks if isinstance(b[4], str) and b[4].strip()]
-            if lefts:
-                median_x = sorted(lefts)[len(lefts)//2]
-            else:
-                median_x = page.rect.width / 2
+def detect_governing_law(text: str) -> List[str]:
+    vals = []
+    for m in GOV_LAW_RE.finditer(text):
+        vals.append(m.group(2).strip())
+    return list(dict.fromkeys(vals))  # uniq preserve order
 
-            left_col, right_col = [], []
-            for b in blocks:
-                txt = b[4] if len(b) > 4 and isinstance(b[4], str) else ""
-                if not txt.strip():
-                    continue
-                (left_col if b[0] < median_x else right_col).append((b[1], b[0], txt))
-
-            left_col.sort(key=lambda x: (x[0], x[1]))
-            right_col.sort(key=lambda x: (x[0], x[1]))
-            ordered_text = "\n".join([t[2] for t in left_col + right_col]).strip()
-
-            wm = []
-            upper = ordered_text.upper()
-            for term in WATERMARK_TERMS:
-                if term in upper:
-                    wm.append(term)
-
-            area = page.rect.width * page.rect.height or 1.0
-            density = min(1.0, max(0.0, len(ordered_text) / max(500.0, area / 5000.0)))
-
-            pages.append(ParsedPage(
-                page_number=i,
-                text=ordered_text,
-                ocr_used=False,
-                rotation=rot,
-                has_tables=False,
-                watermarks=wm,
-                quality_score=float(f"{density:.3f}")
-            ))
+def has_watermark(page: fitz.Page) -> List[str]:
+    wm = []
     try:
-        with pdfplumber.open(str(pdf_path)) as pl:
-            for idx, p in enumerate(pl.pages, start=1):
-                page_tables = p.extract_tables() or []
-                tables_flags.append([str(len(page_tables))])
-                if 1 <= idx <= len(pages):
-                    pages[idx-1].has_tables = bool(page_tables)
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"pdfplumber failed: {e}")
-
-    return pages, tables_flags
-
-def _ocr_low_text_pages(pdf_path: Path, pages: List[ParsedPage]) -> None:
-    logger = logging.getLogger(__name__)
-    try:
-        with fitz.open(str(pdf_path)) as doc:
-            for idx, page in enumerate(doc, start=1):
-                pp = pages[idx-1]
-                if pp.quality_score >= 0.4 and len(pp.text) > 100:
-                    continue
-                pix = page.get_pixmap(dpi=300, annots=False)
-                img = Image.open(io.BytesIO(pix.tobytes("png")))
-                try:
-                    txt = pytesseract.image_to_string(img)
-                except Exception as ocr_e:
-                    logger.warning(f"OCR failed on page {idx}: {ocr_e}")
-                    continue
-                if txt and len(txt) > len(pp.text) * 1.2:
-                    pp.text = txt
-                    pp.ocr_used = True
-                    pp.quality_score = min(1.0, max(0.0, len(txt) / 1500.0))
-    except Exception as e:
-        logger.warning(f"OCR routine error: {e}")
-
-def _docx_to_text(path: Path) -> str:
-    from docx import Document
-    doc = Document(str(path))
-    paras = []
-    for p in doc.paragraphs:
-        paras.append(p.text)
-    for t in doc.tables:
-        for row in t.rows:
-            paras.append(" | ".join(cell.text for cell in row.cells))
-    return "\n".join(s for s in paras if s is not None)
-
-HEADING_PAT = re.compile(
-    r"(?m)^(?:\s*((?:\d{1,2}\.){1,4}\d{0,2}|[A-Z][A-Z0-9 \-]{3,}))\s*$"
-)
-
-def _segment_clauses(text: str):
-    matches = list(HEADING_PAT.finditer(text))
-    from backend.app.schemas.extraction import ClauseSegment  # local import
-    segments = []
-    if not matches:
-        pos = 0
-        parts = [p for p in text.split("\n\n") if p.strip()]
-        for i, p in enumerate(parts, start=1):
-            start = text.find(p, pos)
-            end = start + len(p)
-            segments.append(ClauseSegment(id=f"C{i}", title=None, heading=None, start=start, end=end))
-            pos = end
-        return segments
-
-    for i, m in enumerate(matches, start=1):
-        start = m.start()
-        end = matches[i].start() if i < len(matches) else len(text)
-        heading = m.group(1).strip() if m.group(1) else None
-        title = heading
-        segments.append(ClauseSegment(id=f"C{i}", title=title, heading=heading, start=start, end=end))
-    return segments
-
-def _detect_meta(text: str):
-    from backend.app.schemas.extraction import DetectedMeta
-    meta = DetectedMeta()
-    for m in re.compile(r"(?i)\bgoverned by(?: the laws of)? ([A-Za-z ,&.-]+)").finditer(text):
-        g = m.group(1)
-        if g:
-            meta.governing_law.append(g.strip(",. ").strip())
-    for m in re.compile(r"(?i)\bexclusive jurisdiction of ([A-Za-z ,&.-]+)|\bcourts of ([A-Za-z ,&.-]+)").finditer(text):
-        cand = m.group(1) or m.group(2)
-        if cand:
-            meta.jurisdiction.append(cand.strip(",. ").strip())
-    try:
-        from langdetect import detect as lang_detect
-        lang = lang_detect(text[:2000] if len(text) > 2000 else text)
-        meta.languages.append(lang)
+        txt = page.get_text("text").lower()
+        for key in ("confidential", "draft", "watermark"):
+            if key in txt:
+                wm.append(key)
     except Exception:
         pass
-    upp = text.upper()
-    for sym, code in {"$":"USD","€":"EUR","£":"GBP","¥":"JPY","₹":"INR","C$":"CAD","A$":"AUD"}.items():
-        if sym in text and code not in meta.currencies:
-            meta.currencies.append(code)
-    for code in {"USD","EUR","GBP","JPY","INR","CAD","AUD","CHF","CNY","HKD","SGD","SEK","NOK","DKK"}:
-        if code in upp and code not in meta.currencies:
-            meta.currencies.append(code)
-    return meta
+    return wm
+
+def has_tables_pdfplumber(pl_page) -> bool:
+    try:
+        tables = pl_page.find_tables()
+        return bool(tables)
+    except Exception:
+        return False
+
+def clause_segment(text: str) -> List[ClauseOut]:
+    lines = text.splitlines()
+    clauses: List[ClauseOut] = []
+    offsets: List[int] = []
+    pos = 0
+    for ln in lines:
+        offsets.append(pos)
+        pos += len(ln) + 1  # + newline
+    heads = []
+    for i, ln in enumerate(lines):
+        if ln.strip() and (ln.isupper() or re.match(r"^[A-Z][A-Za-z0-9 ,/&\\-]{2,}$", ln.strip())):
+            heads.append(i)
+    if not heads:
+        return [ClauseOut(id="C1", title=lines[0].strip()[:80] if lines else "Document",
+                          heading=lines[0].strip() if lines else "Document",
+                          start=0, end=len(text))]
+    for idx, start_i in enumerate(heads):
+        end_i = heads[idx+1] if idx + 1 < len(heads) else len(lines)
+        start_offset = offsets[start_i]
+        end_offset = offsets[end_i-1] + len(lines[end_i-1]) + 1 if end_i-1 < len(offsets) else len(text)
+        title = lines[start_i].strip()
+        clauses.append(
+            ClauseOut(
+                id=f"C{idx+1}",
+                title=title[:80] or f"Clause {idx+1}",
+                heading=title or f"Clause {idx+1}",
+                start=start_offset,
+                end=end_offset
+            )
+        )
+    return clauses
+
+
+# ---------- Core service ----------
 
 class ParsingOCRService:
-    async def parse(self, file: Optional[UploadFile], path: Optional[str]):
-        tmp = index_dir() / "_tmp"
-        if file:
-            data = await file.read()
-            src_path = _bytes_to_path(tmp, file.filename or "upload.bin", data)
+    """
+    Canonical entry: parse(file: Optional[UploadFile], path: Optional[str]) -> dict compatible with ParsingResult schema
+    """
+
+    def parse(self, file: Optional[UploadFile], path: Optional[str]):
+        tmp_path = None
+        src_path = None
+
+        if file is not None:
+            suffix = ""
+            if file.filename and "." in file.filename:
+                suffix = os.path.splitext(file.filename)[1]
+            from tempfile import NamedTemporaryFile
+            with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                shutil.copyfileobj(file.file, tmp)
+                tmp_path = tmp.name
+                src_path = tmp_path
+        elif path:
+            src_path = path
         else:
-            src_path = Path(path).expanduser().resolve()
+            raise HTTPException(status_code=400, detail="Provide either an uploaded file or a filesystem path.")
 
-        text_all = ""
-        pages = []
+        try:
+            if not os.path.exists(src_path):
+                raise HTTPException(status_code=404, detail=f"Path not found: {src_path}")
 
-        if src_path.suffix.lower() == ".pdf":
-            pages, _ = _extract_with_fitz(src_path)
-            _ocr_low_text_pages(src_path, pages)
-            for p in pages:
-                text_all += (p.text or "") + "\n\n"
-        elif src_path.suffix.lower() in {".docx"}:
-            text_all = _docx_to_text(src_path)
-            pages = [ParsedPage(page_number=1, text=text_all, ocr_used=False, rotation=0,
-                                has_tables=False, watermarks=[], quality_score=1.0)]
-        else:
-            text_all = src_path.read_text(encoding="utf-8", errors="ignore")
-            pages = [ParsedPage(page_number=1, text=text_all, ocr_used=False, rotation=0,
-                                has_tables=False, watermarks=[], quality_score=1.0)]
+            ext = os.path.splitext(src_path)[1].lower()
+            if ext in (".pdf",):
+                result = self._parse_pdf(src_path)
+            elif ext in (".docx",):
+                result = self._parse_docx(src_path)
+            elif ext in (".txt",):
+                with open(src_path, "r", encoding="utf-8", errors="ignore") as fh:
+                    txt = fh.read()
+                result = self._postprocess_text(txt)
+            else:
+                raise HTTPException(status_code=415, detail=f"Unsupported file type: {ext}")
 
-        normalized = re.sub(r"[ \t]+", " ", text_all).replace("\r", "")
-        clauses = _segment_clauses(normalized)
-        meta = _detect_meta(normalized)
+            return {
+                "pages": [vars(p) for p in result.pages],
+                "normalized_text": result.normalized_text,
+                "clauses": [vars(c) for c in result.clauses],
+                "meta": result.meta,
+            }
 
-        return ParsingResult(
-            pages=pages,
-            normalized_text=normalized,
-            clauses=clauses,
-            meta=meta
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _parse_pdf(self, path: str) -> ParsingResultOut:
+        pages: List[PageOut] = []
+        with fitz.open(path) as doc:
+            try:
+                with pdfplumber.open(path) as pl:
+                    plumber_pages = pl.pages
+            except Exception:
+                plumber_pages = [None] * len(doc)
+
+            for i, page in enumerate(doc, start=1):
+                rotation = int(page.rotation or 0)
+                text = page.get_text("text") or ""
+                ocr_used = False
+                has_tables = False
+
+                if not text.strip() and Image and pytesseract:
+                    pix = page.get_pixmap(dpi=200, alpha=False)
+                    img = Image.open(io.BytesIO(pix.tobytes("png")))
+                    text = pytesseract.image_to_string(img)
+                    ocr_used = True
+
+                if plumber_pages and plumber_pages[i-1] is not None:
+                    has_tables = has_tables_pdfplumber(plumber_pages[i-1])
+
+                watermarks = has_watermark(page)
+                q = min(1.0, 0.4 + 0.0005 * len(text)) - (0.1 if ocr_used else 0.0)
+                q = round(max(0.0, q), 3)
+
+                pages.append(PageOut(
+                    page_number=i,
+                    text=text.strip(),
+                    ocr_used=ocr_used,
+                    rotation=rotation,
+                    has_tables=has_tables,
+                    watermarks=watermarks,
+                    quality_score=q
+                ))
+
+        normalized_text = ("\n\n".join(p.text for p in pages) + "\n").strip()
+        clauses = clause_segment(normalized_text)
+        meta = {
+            "governing_law": detect_governing_law(normalized_text),
+            "jurisdiction": [],
+            "languages": detect_languages(normalized_text),
+            "currencies": detect_currencies(normalized_text),
+        }
+        return ParsingResultOut(pages=pages, normalized_text=normalized_text, clauses=clauses, meta=meta)
+
+    def _parse_docx(self, path: str) -> ParsingResultOut:
+        if Document is None:
+            raise HTTPException(status_code=500, detail="python-docx not installed")
+        doc = Document(path)
+        texts = []
+        for p in doc.paragraphs:
+            t = p.text.strip()
+            if t:
+                texts.append(t)
+        body = "\n".join(texts)
+        page = PageOut(
+            page_number=1,
+            text=body,
+            ocr_used=False,
+            rotation=0,
+            has_tables=False,
+            watermarks=[],
+            quality_score=1.0 if len(body) > 0 else 0.0
         )
+        normalized_text = body
+        clauses = clause_segment(normalized_text)
+        meta = {
+            "governing_law": detect_governing_law(normalized_text),
+            "jurisdiction": [],
+            "languages": detect_languages(normalized_text),
+            "currencies": detect_currencies(normalized_text),
+        }
+        return ParsingResultOut(pages=[page], normalized_text=normalized_text, clauses=clauses, meta=meta)
+
+    def _postprocess_text(self, text: str) -> ParsingResultOut:
+        t = text.strip()
+        page = PageOut(
+            page_number=1,
+            text=t,
+            ocr_used=False,
+            rotation=0,
+            has_tables=False,
+            watermarks=[],
+            quality_score=1.0 if len(t) > 0 else 0.0
+        )
+        normalized_text = t + ("\n" if not t.endswith("\n") else "")
+        clauses = clause_segment(normalized_text)
+        meta = {
+            "governing_law": detect_governing_law(normalized_text),
+            "jurisdiction": [],
+            "languages": detect_languages(normalized_text),
+            "currencies": detect_currencies(normalized_text),
+        }
+        return ParsingResultOut(pages=[page], normalized_text=normalized_text, clauses=clauses, meta=meta)

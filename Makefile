@@ -21,8 +21,8 @@ setup:
 run:
 	@$(ACT); \
 	echo "Starting FastAPI on http://127.0.0.1:8000 and Streamlit on http://127.0.0.1:8501"; \
-	(API_URL=http://127.0.0.1:8000 $(UVICORN) $(API_APP) --host 0.0.0.0 --port 8000 --reload & \
-	API_URL=http://127.0.0.1:8000 $(STREAMLIT) run $(ST_HOME) --server.port 8501 --server.headless true); \
+	(PYTHONPATH="$(PWD)" API_URL=http://127.0.0.1:8000 $(UVICORN) $(API_APP) --host 0.0.0.0 --port 8000 --reload & \
+	 PYTHONPATH="$(PWD)" API_URL=http://127.0.0.1:8000 $(STREAMLIT) run $(ST_HOME) --server.port 8501 --server.headless true); \
 	trap 'pkill -f "$(API_APP)"; pkill -f "streamlit run";' EXIT
 
 validate-data:

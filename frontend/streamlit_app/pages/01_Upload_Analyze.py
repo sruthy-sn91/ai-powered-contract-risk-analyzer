@@ -1,7 +1,13 @@
 from __future__ import annotations
-import io
 import streamlit as st
-from frontend.streamlit_app.utils import api_post, mask_pii, role_badge, init_session
+
+from frontend.streamlit_app.utils import (
+    init_session,
+    role_badge,
+    mask_pii,
+    post_parsing,
+    post_parsing_json_path,
+)
 
 st.set_page_config(page_title="Upload & Analyze", layout="wide")
 init_session()
@@ -9,28 +15,40 @@ role_badge()
 
 st.title("📄 Upload & Analyze")
 
-tab1, tab2 = st.tabs(["Upload File", "Filesystem Path"])
+tab1, tab2, tab3 = st.tabs(["Upload File", "Filesystem Path (form)", "Filesystem Path (JSON)"])
 
 with tab1:
-    up = st.file_uploader("Upload PDF or DOCX", type=["pdf","docx"])
-    if up and st.button("Parse"):
-        resp = api_post("/api/v1/parsing-ocr/parse", {})
-        # multipart not supported via simple helper; use requests directly:
-        import requests
-        url = st.secrets.get("API_URL", None) or "http://127.0.0.1:8000"
-        r = requests.post(f"{url}/api/v1/parsing-ocr/parse", files={"file": up.getvalue()})
-        if r.ok:
-            data = r.json()
-            st.session_state["last_parsing"] = data
+    up = st.file_uploader("Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"])
+    if st.button("Parse", key="parse_upload"):
+        if up is None:
+            st.warning("Please choose a file.")
         else:
-            st.error(r.text)
+            data = post_parsing(file=up)
+            if data:
+                st.session_state["last_parsing"] = data
+                st.success("Parsed via multipart upload.")
 
 with tab2:
-    p = st.text_input("Filesystem path", value="")
-    if st.button("Parse from Path"):
-        data = api_post("/api/v1/parsing-ocr/parse", {"path": p})
-        if data:
-            st.session_state["last_parsing"] = data
+    p_form = st.text_input("Absolute filesystem path (form-data)", value="")
+    if st.button("Parse from Path (Form)", key="parse_form_path"):
+        if not p_form.strip():
+            st.warning("Please provide an absolute path.")
+        else:
+            data = post_parsing(path=p_form.strip())
+            if data:
+                st.session_state["last_parsing"] = data
+                st.success("Parsed via form path.")
+
+with tab3:
+    p_json = st.text_input("Absolute filesystem path (JSON body)", value="")
+    if st.button("Parse from Path (JSON)", key="parse_json_path"):
+        if not p_json.strip():
+            st.warning("Please provide an absolute path.")
+        else:
+            data = post_parsing_json_path(p_json.strip())
+            if data:
+                st.session_state["last_parsing"] = data
+                st.success("Parsed via JSON path.")
 
 st.divider()
 if st.session_state.get("last_parsing"):
@@ -38,13 +56,18 @@ if st.session_state.get("last_parsing"):
     st.subheader("Detected Metadata")
     st.json(data.get("meta", {}))
 
-    redact = st.toggle("Redact PII (viewer/risk). Legal can unmask.", value=st.session_state.get("pii_redact", True))
+    redact = st.toggle(
+        "Redact PII (viewer/risk). Legal can unmask.",
+        value=st.session_state.get("pii_redact", True),
+    )
     st.session_state["pii_redact"] = redact
     st.caption("Per-page quality, OCR flag, rotation, tables & watermarks")
 
     for pg in data.get("pages", []):
-        with st.expander(f"Page {pg['page_number']}  •  quality={pg['quality_score']}  •  OCR={pg['ocr_used']}  •  tables={pg['has_tables']}"):
-            text = pg.get("text","")
+        with st.expander(
+            f"Page {pg['page_number']}  •  quality={pg['quality_score']}  •  OCR={pg['ocr_used']}  •  tables={pg['has_tables']}"
+        ):
+            text = pg.get("text", "")
             if redact and st.session_state.get("role") != "legal":
                 text = mask_pii(text, True)
             st.text_area("Text", value=text, height=200, key=f"p{pg['page_number']}_text")
