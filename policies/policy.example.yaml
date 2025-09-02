@@ -1,0 +1,21 @@
+name: "Default Contract Policy"
+version: "1.0"
+
+rules:
+  - id: LIAB-UNLIMITED
+    description: Flag unlimited liability
+    severity: high
+    tags: ["liability"]
+    pattern: "(?i)unlimited liability"
+
+  - id: TFC-ONESIDED
+    description: Termination for convenience is one-sided
+    severity: high
+    tags: ["termination"]
+    pattern: "(?i)termination for convenience.*(by the (customer|client) only)"
+
+  - id: GOVLAW-NY-DE
+    description: Governing law is NY or Delaware
+    severity: medium
+    tags: ["governing law"]
+    pattern: "(?i)governed by the laws of (new york|delaware)"

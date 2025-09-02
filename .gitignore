@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Envs
+.venv/
+venv/
+env/
+
+# OS junk
+.DS_Store
+
+# Models / large artifacts (track with LFS if needed)
+models/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.onnx
+
+# Build/Dist
+dist/
+build/
